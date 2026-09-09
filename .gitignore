@@ -1,0 +1,12 @@
+/twisp-parquet-tool
+*.duckdb
+*.duckdb.wal
+*.duckdb.tmp/
+.env
+.env.*
+*.parquet
+
+# Editor locks, auto-saves, and backups
+.#*
+\#*#
+*~
