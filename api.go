@@ -23,9 +23,12 @@ type apiClient struct {
 }
 
 func newAPI(c config) *apiClient {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConnsPerHost = max(c.Workers, 16)
+	transport.MaxIdleConns = max(100, 2*transport.MaxIdleConnsPerHost)
 	return &apiClient{
 		endpoint: c.Endpoint, token: c.Token, tenant: c.Tenant, retries: c.Retries, backoff: time.Second,
-		http: &http.Client{Timeout: c.Timeout, CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		http: &http.Client{Transport: transport, Timeout: c.Timeout, CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse // Presigned URLs and API endpoints should be final URLs.
 		}},
 	}
@@ -135,16 +138,20 @@ type filePage struct {
 }
 
 func (a *apiClient) list(ctx context.Context, prefix string, size int, token *string) (*filePage, error) {
+	return a.listWithDownloads(ctx, prefix, size, token, true)
+}
+
+func (a *apiClient) listWithDownloads(ctx context.Context, prefix string, size int, token *string, downloads bool) (*filePage, error) {
 	var data struct {
 		Files *struct {
 			Page *filePage `json:"listPage"`
 		} `json:"files"`
 	}
-	err := a.graphql(ctx, `query ListParquetFiles($prefix: String!, $size: Int!, $token: String) {
+	err := a.graphql(ctx, `query ListParquetFiles($prefix: String!, $size: Int!, $token: String, $downloads: Boolean!) {
   files { listPage(keyPrefix: $prefix, pageSize: $size, pageToken: $token) {
-    keys { key download { downloadURL downloadURLExpiration downloadHeaders } } nextPageToken
+    keys { key download @include(if: $downloads) { downloadURL downloadURLExpiration downloadHeaders } } nextPageToken
   } }
-}`, map[string]any{"prefix": prefix, "size": size, "token": token}, &data)
+}`, map[string]any{"prefix": prefix, "size": size, "token": token, "downloads": downloads}, &data)
 	if err != nil {
 		return nil, err
 	}
@@ -182,6 +189,41 @@ func (a *apiClient) link(ctx context.Context, key string) (*downloadLink, error)
 		return nil, errors.New("GraphQL returned no download URL")
 	}
 	return data.Files.Download, nil
+}
+
+// Generate missing links in one GraphQL request per chunk, only after checkpoint filtering.
+func (a *apiClient) fillLinks(ctx context.Context, tasks []fileTask) error {
+	var declarations, selections []string
+	variables := map[string]any{}
+	indexes := map[string]int{}
+	for i, task := range tasks {
+		if task.Link != nil && task.Link.URL != "" {
+			continue
+		}
+		name := fmt.Sprintf("f%d", i)
+		declarations = append(declarations, "$"+name+": String!")
+		selections = append(selections, name+": createDownload(key: $"+name+") { downloadURL downloadHeaders }")
+		variables[name], indexes[name] = task.Key, i
+	}
+	if len(indexes) == 0 {
+		return nil
+	}
+	var data struct {
+		Files map[string]*downloadLink `json:"files"`
+	}
+	query := "mutation DownloadParquetBatch(" + strings.Join(declarations, ",") + ") { files { " + strings.Join(selections, " ") + " } }"
+	if err := a.graphql(ctx, query, variables, &data); err != nil {
+		return err
+	}
+	for name, i := range indexes {
+		link := data.Files[name]
+		if link == nil || link.URL == "" {
+			return fmt.Errorf("GraphQL returned no download URL for %s", tasks[i].Key)
+		}
+		link.ReceivedAt = time.Now()
+		tasks[i].Link = link
+	}
+	return nil
 }
 
 func (a *apiClient) download(ctx context.Context, key string, initial *downloadLink, dir string) (string, int64, error) {

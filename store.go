@@ -14,7 +14,10 @@ import (
 
 type store struct {
 	db             *sql.DB
-	entities       sync.Map // entity -> context-aware gate; one transaction per entity
+	entities       sync.Map // entity -> *entityState, guarded by its gate
+	sourceSchemas  sync.Map // physical Parquet schema signature -> []column
+	lookupFiles    *sql.Stmt
+	recordFiles    *sql.Stmt
 	identity       sync.RWMutex
 	tenantID       string // protected by identity; first successful nonempty import binds it
 	migratedTables int
@@ -95,6 +98,16 @@ func openStore(ctx context.Context, path, endpoint, tenant, memoryLimit string) 
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
 	}
+	s.lookupFiles, err = db.PrepareContext(ctx, `SELECT key FROM _twisp.imported_files WHERE key IN (SELECT unnest(?))`)
+	if err != nil {
+		return nil, err
+	}
+	s.recordFiles, err = db.PrepareContext(ctx, `INSERT INTO _twisp.imported_files(key,entity,row_count,byte_count)
+        SELECT unnest(?), ?, unnest(?), unnest(?)`)
+	if err != nil {
+		s.lookupFiles.Close()
+		return nil, err
+	}
 	ok = true
 	return s, nil
 }
@@ -115,15 +128,40 @@ func bindSetting(ctx context.Context, tx *sql.Tx, name, value string) error {
 	return nil
 }
 
-func (s *store) Close() error { return s.db.Close() }
+func (s *store) Close() error {
+	return errors.Join(s.lookupFiles.Close(), s.recordFiles.Close(), s.db.Close())
+}
 func (s *store) checkpoint(ctx context.Context) error {
 	_, err := s.db.ExecContext(ctx, "CHECKPOINT")
 	return err
 }
 func (s *store) hasFile(ctx context.Context, key string) (bool, error) {
-	var found bool
-	err := s.db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM _twisp.imported_files WHERE key = ?)`, key).Scan(&found)
-	return found, err
+	keys, err := s.hasFiles(ctx, []string{key})
+	return keys[key], err
+}
+
+func (s *store) hasFiles(ctx context.Context, keys []string) (map[string]bool, error) {
+	return lookupKeys(ctx, s.lookupFiles, keys)
+}
+
+func lookupKeys(ctx context.Context, stmt *sql.Stmt, keys []string) (map[string]bool, error) {
+	found := make(map[string]bool)
+	if len(keys) == 0 {
+		return found, nil
+	}
+	rows, err := stmt.QueryContext(ctx, keys)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return nil, err
+		}
+		found[key] = true
+	}
+	return found, rows.Err()
 }
 
 type column struct{ Name, Type string }
@@ -154,149 +192,10 @@ func columnMap(cols []column) map[string]string {
 	return out
 }
 
-// Each file, its schema/view updates, and its checkpoint commit atomically. A failed
-// or interrupted import can be rerun without skipping data or inserting it twice.
+// Single-file entry point also uses the batched implementation.
 func (s *store) importFile(ctx context.Context, task fileTask, path string, size int64) (int64, bool, error) {
-	if !entityName.MatchString(task.Entity) {
-		return 0, false, errors.New("invalid entity name")
-	}
-	gate, _ := s.entities.LoadOrStore(task.Entity, make(chan struct{}, 1))
-	select {
-	case gate.(chan struct{}) <- struct{}{}:
-	case <-ctx.Done():
-		return 0, false, ctx.Err()
-	}
-	defer func() { <-gate.(chan struct{}) }()
-	// Serialize only startup until one successful import establishes tenant identity.
-	// Every later entity transaction can hold the read lock concurrently.
-	s.identity.RLock()
-	if s.tenantID == "" {
-		s.identity.RUnlock()
-		s.identity.Lock()
-		defer s.identity.Unlock()
-	} else {
-		defer s.identity.RUnlock()
-	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return 0, false, err
-	}
-	defer tx.Rollback()
-	var loaded bool
-	if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM _twisp.imported_files WHERE key = ?)`, task.Key).Scan(&loaded); err != nil {
-		return 0, false, err
-	}
-	if loaded {
-		return 0, false, nil
-	}
-	source := `read_parquet(` + literal(path) + `, hive_partitioning = false)`
-	sourceColumns, err := columns(ctx, tx, source)
-	if err != nil {
-		return 0, false, fmt.Errorf("read Parquet schema: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE _twisp_incoming AS SELECT `+normalizedProjection(sourceColumns)+` FROM `+source); err != nil {
-		return 0, false, fmt.Errorf("read Parquet: %w", err)
-	}
-	incoming, err := columns(ctx, tx, "_twisp_incoming")
-	if err != nil {
-		return 0, false, err
-	}
-	types := columnMap(incoming)
-	for _, name := range []string{"record_begin", "record_rowid", "record_status", "record_tenantid", "record_version"} {
-		if _, ok := types[name]; !ok {
-			return 0, false, fmt.Errorf("Parquet is missing CDC column %s", name)
-		}
-	}
-	switch types["record_version"] {
-	case "UTINYINT", "USMALLINT", "UINTEGER", "UBIGINT", "TINYINT", "SMALLINT", "INTEGER", "BIGINT", "HUGEINT", "UHUGEINT":
-	default:
-		return 0, false, errors.New("record_version must have an integer Parquet type")
-	}
-	var rowCount, tenantCount, invalid int64
-	var tenantUUID sql.NullString
-	err = tx.QueryRowContext(ctx, `SELECT count(*), count(DISTINCT record_tenantid), min(CAST(record_tenantid AS VARCHAR)),
-      count(*) FILTER (WHERE record_begin IS NULL OR record_rowid IS NULL OR record_rowid = '' OR
-        record_version IS NULL OR record_version < 0 OR record_tenantid IS NULL OR record_tenantid = '' OR
-        record_status IS NULL OR record_status NOT IN ('ALIVE', 'EOL', 'DELETE'))
-      FROM _twisp_incoming`).Scan(&rowCount, &tenantCount, &tenantUUID, &invalid)
-	if err != nil {
-		return 0, false, err
-	}
-	if invalid != 0 {
-		return 0, false, fmt.Errorf("Parquet contains %d rows with invalid CDC metadata", invalid)
-	}
-	if tenantCount > 1 {
-		return 0, false, errors.New("Parquet contains more than one record_tenantid")
-	}
-	if tenantUUID.Valid {
-		if err := bindSetting(ctx, tx, "record_tenantid", tenantUUID.String); err != nil {
-			return 0, false, err
-		}
-	}
-	rawName := "parquet_" + task.Entity
-	raw := "root." + ident(rawName)
-	var exists bool
-	if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'root' AND table_name = ?)`, rawName).Scan(&exists); err != nil {
-		return 0, false, err
-	}
-	var added []column
-	if exists {
-		current, err := columns(ctx, tx, raw)
-		if err != nil {
-			return 0, false, err
-		}
-		types := columnMap(current)
-		for _, col := range incoming {
-			old, found := types[col.Name]
-			if !found {
-				added = append(added, col)
-				continue
-			}
-			if old != col.Type {
-				return 0, false, fmt.Errorf("schema type changed for %s.%s: %s -> %s; refusing a potentially lossy cast", task.Entity, col.Name, old, col.Type)
-			}
-		}
-	}
-	// Existing views see appended rows automatically. Only rebuild them when the
-	// schema changes, avoiding unnecessary catalog writes on every imported file.
-	rebuildViews := !exists || len(added) > 0
-	if rebuildViews {
-		if err := dropEntityViews(ctx, tx, task.Entity); err != nil {
-			return 0, false, err
-		}
-	}
-	if !exists {
-		if _, err := tx.ExecContext(ctx, "CREATE TABLE "+raw+" AS SELECT * FROM _twisp_incoming WHERE false"); err != nil {
-			return 0, false, err
-		}
-	} else {
-		for _, col := range added {
-			if _, err := tx.ExecContext(ctx, "ALTER TABLE "+raw+" ADD COLUMN "+ident(col.Name)+" "+col.Type); err != nil {
-				return 0, false, err
-			}
-		}
-	}
-	if _, err := tx.ExecContext(ctx, "INSERT INTO "+raw+" BY NAME SELECT * FROM _twisp_incoming"); err != nil {
-		return 0, false, err
-	}
-	if rebuildViews {
-		if err := createViews(ctx, tx, task.Entity); err != nil {
-			return 0, false, err
-		}
-	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO _twisp.imported_files(key, entity, row_count, byte_count) VALUES (?, ?, ?, ?)`, task.Key, task.Entity, rowCount, size); err != nil {
-		return 0, false, err
-	}
-	if _, err := tx.ExecContext(ctx, "DROP TABLE _twisp_incoming"); err != nil {
-		return 0, false, err
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, false, err
-	}
-	if s.tenantID == "" && tenantUUID.Valid {
-		s.tenantID = tenantUUID.String
-	}
-	return rowCount, true, nil
+	result, err := s.importBatch(ctx, []downloadedFile{{Task: task, Path: path, Size: size}})
+	return result.Rows, result.Imported != 0, err
 }
 
 func createViews(ctx context.Context, tx *sql.Tx, entity string) error {

@@ -12,7 +12,7 @@ import (
 
 const fixtureTenant = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 
-func fixtureParquet(t *testing.T, query string) string {
+func fixtureParquet(t testing.TB, query string) string {
 	t.Helper()
 	db, err := sql.Open("duckdb", "")
 	if err != nil {

@@ -55,6 +55,24 @@ func (f *pipelineFixture) importFile(ctx context.Context, task fileTask, path st
 	}
 }
 
+func (f *pipelineFixture) importBatch(ctx context.Context, files []downloadedFile) (totals, error) {
+	var result totals
+	for _, file := range files {
+		rows, imported, err := f.importFile(ctx, file.Task, file.Path, file.Size)
+		if err != nil {
+			return totals{}, err
+		}
+		if imported {
+			result.Imported++
+			result.Rows += rows
+			result.Bytes += file.Size
+		} else {
+			result.Skipped++
+		}
+	}
+	return result, nil
+}
+
 func TestPipelineImportsDifferentEntitiesConcurrently(t *testing.T) {
 	dir := t.TempDir()
 	f := &pipelineFixture{active: map[string]int{}, started: make(chan string, 4), release: make(chan struct{})}

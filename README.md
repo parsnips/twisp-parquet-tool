@@ -55,13 +55,13 @@ The default prefix is `warehouse`, covering every retained partition exposed by
 the Files API. The query uses pagination and obtains download links inline:
 
 ```graphql
-query ListParquetFiles($prefix: String!, $size: Int!, $token: String) {
+query ListParquetFiles($prefix: String!, $size: Int!, $token: String, $downloads: Boolean!) {
   files {
     listPage(keyPrefix: $prefix, pageSize: $size, pageToken: $token) {
       nextPageToken
       keys {
         key
-        download {
+        download @include(if: $downloads) {
           downloadURL
           downloadURLExpiration
           downloadHeaders
@@ -74,13 +74,13 @@ query ListParquetFiles($prefix: String!, $size: Int!, $token: String) {
 
 The importer follows continuation tokens, including tokens on empty pages, until
 the final page. Listing, downloads, and imports run as a bounded pipeline across
-page boundaries. By default, four files can download while up to four entity
+page boundaries. By default, 16 files can download while up to four entity
 types import concurrently on separate DuckDB connections. Each entity has one
 active import at a time, so its schema and views can be updated safely. Queued
 files for a busy entity do not consume the other entities' import workers.
 
 ```bash
-./twisp-parquet-tool -db ledger.duckdb -workers 8 -import-workers 4
+./twisp-parquet-tool -db ledger.duckdb -workers 32 -import-workers 4 -batch-size 128
 ```
 
 `-workers` controls downloads; `-import-workers` controls concurrent entity
@@ -97,15 +97,24 @@ Downloads use the signed headers. Expired links are renewed through
 HTTP errors are retried with backoff; authentication and GraphQL errors stop the
 run with a nonzero exit status.
 
-Each file is loaded into DuckDB in a transaction together with its schema updates,
-views, and import checkpoint. Existing views are only rebuilt when the schema
-changes. Failed files are rolled back. Successful files stay
-available even if a later file fails or you interrupt the process. Downloads are
+Each entity imports batches of up to 128 files or 64 MiB of compressed Parquet,
+flushing partial batches after one second when an import worker is available.
+Files with matching physical schemas share a DuckDB read; different schemas are
+normalized separately within the same transaction. Schema information is cached,
+views are only rebuilt on schema changes, and checkpoints are written in bulk.
+One oversized file can form a batch on its own.
+
+Every batch commits its rows, schema updates, views, and individual file
+checkpoints atomically. If a batch fails or the process dies, that entire batch
+is retried on resume. Previously committed batches remain available. Downloads are
 temporary and are removed after import; the resulting views reference local
 DuckDB tables, not remote URLs or Parquet files.
 
 Rerun the same command to resume or pick up new files. Each run lists the prefix
-from the beginning and skips keys recorded in `_twisp.imported_files`. This also
+from the beginning and checks `_twisp.imported_files` once per page. Resume listing
+initially requests keys without download URLs, so already imported files do not
+need URL signing or downloading. Missing links are generated in groups of up to
+100; subsequent wholly new pages use inline links again. This also
 finds newly delivered files in older partitions. Keys are assumed immutable;
 overwriting an object under an already-imported key will not reload it.
 
@@ -159,7 +168,7 @@ The upgraded database requires this version of the tool.
 
 Other Parquet types are preserved. Additive schema changes are supported: new columns
 are added, inserts match by name, and older rows/files get NULL for absent
-columns. A change to an existing column's type fails the file transaction instead
+columns. A change to an existing column's type fails the batch transaction instead
 of applying a potentially lossy cast.
 
 These views match the Redshift record-selection semantics; this is not a general
@@ -231,9 +240,14 @@ the entity views in `main` and `public`, and `_twisp`.
 -endpoint       TWISP_ENDPOINT, or the US East 1 cloud GraphQL endpoint
 -db             twisp.duckdb
 -prefix         warehouse
--page-size      250 (1–1000)
--workers        4 (1–64; concurrent downloads)
+-page-size      1000 (1–1000)
+-workers        16 (1–64; concurrent downloads)
 -import-workers 4 (1–64; concurrent entities, one import per entity)
+-batch-size     128 (1–4096; files per entity transaction)
+-batch-bytes    67108864 (64 MiB compressed; one oversized file allowed)
+-batch-wait     1s (partial batch collection time when a worker is available)
+-buffer-files   1024 (1–65536; pending downloaded files)
+-buffer-bytes   268435456 (256 MiB pending compressed download threshold)
 -retries        4 (0–10; retries after the first attempt)
 -timeout        10m per HTTP request
 -memory-limit   1GB for DuckDB; queries can spill to disk
@@ -248,10 +262,37 @@ For example, use a narrower UTC date prefix when only a subset is needed:
 ```
 
 Allow disk space for the database, DuckDB spill files, and concurrent temporary
-downloads. The pipeline bounds queued files, not their total bytes. An automatic
+downloads. The pending queue applies backpressure at either the file count or
+byte threshold. Disk usage also includes active batches, the download channel,
+and in-flight downloads; the byte threshold can be exceeded by one received file.
+Buffer pressure flushes partial batches to keep the pipeline moving. HTTP
+connections are pooled for the configured download concurrency. An automatic
 encoding migration may temporarily need extra disk space for rewritten columns.
 `-memory-limit` controls DuckDB, not the entire process's memory.
 Paths containing `?` or `%` are rejected because of the Go driver's DSN handling.
+
+## Small-file performance
+
+For a warehouse with many tiny files, start with the defaults or increase downloads
+to `-workers 32`. Batches can be tuned independently with `-batch-size 256` or
+`-batch-size 512`. Larger batches amortize transaction and query planning costs,
+but require more temporary space and repeat more work after an interrupted batch.
+Use `-batch-size 1` when diagnosing a particular file failure.
+
+On an Apple M1 Max, a local benchmark of 256 five-row Parquet files improved from
+about **248 files/s before batching to 2,559 files/s with batches of 128** (median
+of three runs, durable file checkpoints included). This measures database ingestion
+only; API listing, URL signing, and downloads are excluded. Full-run throughput
+will depend on those services, file sizes, and entity distribution.
+
+```bash
+go test -run '^$' -bench 'Benchmark.*SmallFiles' -benchtime=1x -count=3
+```
+
+To use an updated binary with an import already running, interrupt the old process
+with Ctrl-C, wait for it to exit, and rerun against the same database. Replacing
+the binary does not change the code in an already running process. Existing
+checkpoints work with batching; no reimport or database migration is needed.
 
 ## Coverage and completeness
 
@@ -283,7 +324,8 @@ inline downloads, expired-link refresh, signed headers, authentication isolation
 transient errors, cancellation, failed-run resume, duplicate CDC records,
 DELETE/EOL precedence, schema evolution, tenant binding, mixed binary/text UUIDs,
 automatic database migration with resume, overlapping entity imports, per-entity
-serialization, pipeline cancellation, and offline persistence.
+serialization, batch size/byte limits and partial flushing, atomic batch rollback,
+checkpoint filtering before URL signing, pipeline cancellation, and offline persistence.
 The optional DuckDB CLI test runs when `duckdb` is on PATH. No live Twisp token or
 tenant is needed to run the tests.
 

@@ -23,6 +23,7 @@ type config struct {
 	Token, Tenant, Endpoint, Database, Prefix, TempDir, MemoryLimit string
 	PageSize, Workers, ImportWorkers, Retries                       int
 	Timeout                                                         time.Duration
+	Batch                                                           batchOptions
 }
 
 func parseConfig(args []string) (config, error) {
@@ -40,11 +41,16 @@ func parseConfig(args []string) (config, error) {
 	fs.StringVar(&c.Prefix, "prefix", "warehouse", "Warehouse key prefix; default lists every available partition")
 	fs.StringVar(&c.TempDir, "temp-dir", "", "Parent directory for temporary downloads (default OS temp directory)")
 	fs.StringVar(&c.MemoryLimit, "memory-limit", "1GB", "DuckDB memory limit; larger queries can spill to disk")
-	fs.IntVar(&c.PageSize, "page-size", 250, "Files per listing page (1–1000)")
-	fs.IntVar(&c.Workers, "workers", 4, "Concurrent Parquet downloads")
+	fs.IntVar(&c.PageSize, "page-size", 1000, "Files per listing page (1–1000)")
+	fs.IntVar(&c.Workers, "workers", 16, "Concurrent Parquet downloads")
 	fs.IntVar(&c.ImportWorkers, "import-workers", 4, "Concurrent DuckDB imports across entity types (one per entity)")
 	fs.IntVar(&c.Retries, "retries", 4, "Retries for transient API/download failures")
 	fs.DurationVar(&c.Timeout, "timeout", 10*time.Minute, "Timeout for each HTTP request, including a download")
+	fs.IntVar(&c.Batch.Size, "batch-size", 128, "Maximum files per entity transaction")
+	fs.Int64Var(&c.Batch.Bytes, "batch-bytes", 64<<20, "Target maximum compressed bytes per batch (one oversized file allowed)")
+	fs.DurationVar(&c.Batch.Wait, "batch-wait", time.Second, "Maximum time to collect a partial batch when an import worker is available")
+	fs.IntVar(&c.Batch.BufferFiles, "buffer-files", 1024, "Maximum pending downloaded files, excluding active batches")
+	fs.Int64Var(&c.Batch.BufferBytes, "buffer-bytes", 256<<20, "Pending download byte threshold; pauses downloads through backpressure")
 	if err := fs.Parse(args); err != nil {
 		return c, err
 	}
@@ -75,6 +81,9 @@ func parseConfig(args []string) (config, error) {
 	}
 	if c.PageSize < 1 || c.PageSize > 1000 || c.Workers < 1 || c.Workers > 64 || c.ImportWorkers < 1 || c.ImportWorkers > 64 || c.Retries < 0 || c.Retries > 10 || c.Timeout <= 0 {
 		return c, errors.New("require page-size 1–1000, workers and import-workers 1–64, retries 0–10, and a positive timeout")
+	}
+	if c.Batch.Size < 1 || c.Batch.Size > 4096 || c.Batch.Bytes < 1 || c.Batch.BufferFiles < 1 || c.Batch.BufferFiles > 65536 || c.Batch.BufferBytes < 1 || c.Batch.Wait <= 0 {
+		return c, errors.New("require batch-size 1–4096, buffer-files 1–65536, and positive batch-bytes, buffer-bytes, and batch-wait")
 	}
 	return c, nil
 }
@@ -126,18 +135,32 @@ func run(ctx context.Context, c config, logger *log.Logger) (totals, error) {
 	defer os.RemoveAll(dir)
 	api := newAPI(c)
 	defer api.http.CloseIdleConnections()
-	pipeline := newImportPipeline(ctx, api, s, dir, c.Workers, imports, logger)
-	logger.Printf("pipeline: %d downloads, up to %d concurrent entity imports", c.Workers, imports)
+	pipeline := newImportPipeline(ctx, api, s, dir, c.Workers, imports, logger, c.Batch)
+	logger.Printf("pipeline: %d downloads, up to %d concurrent entity imports, up to %d files per batch", c.Workers, imports, c.Batch.defaults().Size)
 	var skipped int64
 	listErr := func() error {
+		var anyImported bool
+		if err := s.db.QueryRowContext(pipeline.ctx, "SELECT EXISTS (SELECT 1 FROM _twisp.imported_files LIMIT 1)").Scan(&anyImported); err != nil {
+			return err
+		}
+		includeDownloads := !anyImported
 		var pageToken *string
 		seen := map[string]bool{}
 		for page := 1; ; page++ {
-			listing, err := api.list(pipeline.ctx, c.Prefix, c.PageSize, pageToken)
+			listing, err := api.listWithDownloads(pipeline.ctx, c.Prefix, c.PageSize, pageToken, includeDownloads)
 			if err != nil {
 				return fmt.Errorf("list page %d: %w", page, err)
 			}
 			logger.Printf("page %d: %d keys", page, len(listing.Keys))
+			keys := make([]string, len(listing.Keys))
+			for i, entry := range listing.Keys {
+				keys[i] = entry.Key
+			}
+			loaded, err := s.hasFiles(pipeline.ctx, keys)
+			if err != nil {
+				return err
+			}
+			var pending []fileTask
 			for _, entry := range listing.Keys {
 				if !strings.HasPrefix(entry.Key, c.Prefix) {
 					return fmt.Errorf("API returned key outside requested prefix: %q", entry.Key)
@@ -146,16 +169,26 @@ func run(ctx context.Context, c config, logger *log.Logger) (totals, error) {
 				if err != nil {
 					return err
 				}
-				loaded, err := s.hasFile(pipeline.ctx, entry.Key)
-				if err != nil {
-					return err
-				}
-				if loaded {
+				if loaded[entry.Key] {
 					skipped++
 					continue
 				}
-				if err := pipeline.enqueue(fileTask{Key: entry.Key, Entity: entity, Link: entry.Download}); err != nil {
+				pending = append(pending, fileTask{Key: entry.Key, Entity: entity, Link: entry.Download})
+			}
+			// Resume pages avoid signing URLs for keys already committed. Once a
+			// wholly new page is reached, request inline links on subsequent pages.
+			if len(listing.Keys) > 0 {
+				includeDownloads = len(loaded) == 0
+			}
+			for start := 0; start < len(pending); start += 100 {
+				chunk := pending[start:min(start+100, len(pending))]
+				if err := api.fillLinks(pipeline.ctx, chunk); err != nil {
 					return err
+				}
+				for _, task := range chunk {
+					if err := pipeline.enqueue(task); err != nil {
+						return err
+					}
 				}
 			}
 			pageToken = listing.NextPageToken

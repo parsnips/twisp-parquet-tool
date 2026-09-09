@@ -263,3 +263,107 @@ func TestFailureResumeAndRepeatedPageToken(t *testing.T) {
 		t.Fatalf("expected repeat detection: %v", err)
 	}
 }
+
+func TestResumeSkipsSigningCommittedFilesAndBatchesMissingLinks(t *testing.T) {
+	data, err := os.ReadFile(fixtureParquet(t, fixtureQuery(`('a',1,'ALIVE','a')`, "")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := "warehouse/parquet/2026/09/01/00/account/"
+	var mu sync.Mutex
+	var modes []bool
+	var signed []string
+	mutations, downloads := 0, 0
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/graphql" {
+			mu.Lock()
+			downloads++
+			mu.Unlock()
+			w.Write(data)
+			return
+		}
+		var req struct {
+			Query     string
+			Variables map[string]any
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Error(err)
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		link := func(key string) any {
+			signed = append(signed, key)
+			return map[string]any{"downloadURL": server.URL + "/parquet"}
+		}
+		if strings.Contains(req.Query, "createDownload") {
+			mutations++
+			fields := map[string]any{}
+			for alias, key := range req.Variables {
+				fields[alias] = link(key.(string))
+			}
+			respond(t, w, map[string]any{"files": fields})
+			return
+		}
+		include, ok := req.Variables["downloads"].(bool)
+		if !ok || !strings.Contains(req.Query, "download @include(if: $downloads)") {
+			t.Error("missing conditional download selection")
+		}
+		modes = append(modes, include)
+		token, _ := req.Variables["token"].(string)
+		var names []string
+		var next any
+		switch token {
+		case "":
+			names = []string{"old1"}
+			next = "mixed"
+		case "mixed":
+			names = []string{"old2", "new1", "new2"}
+			next = "new"
+		case "new":
+			names = []string{"new3"}
+			next = "inline"
+		case "inline":
+			names = []string{"new4"}
+		default:
+			t.Errorf("unexpected token: %s", token)
+		}
+		keys := []any{}
+		for _, name := range names {
+			key := base + name + ".parquet"
+			item := map[string]any{"key": key}
+			if include {
+				item["download"] = link(key)
+			}
+			keys = append(keys, item)
+		}
+		respond(t, w, map[string]any{"files": map[string]any{"listPage": map[string]any{"keys": keys, "nextPageToken": next}}})
+	}))
+	defer server.Close()
+	c := config{Token: "secret", Tenant: "Sandbox", Endpoint: server.URL + "/graphql", Database: filepath.Join(t.TempDir(), "resume.duckdb"), Prefix: "warehouse", PageSize: 1000, Workers: 4, MemoryLimit: "256MB", Timeout: 5 * time.Second}
+	s, err := openStore(context.Background(), c.Database, c.Endpoint, c.Tenant, c.MemoryLimit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"old1", "old2"} {
+		if _, err := s.db.Exec("INSERT INTO _twisp.imported_files(key,entity,row_count,byte_count) VALUES (?,'account',0,0)", base+name+".parquet"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.Close()
+	result, err := run(context.Background(), c, log.New(io.Discard, "", 0))
+	if err != nil || result.Imported != 4 || result.Skipped != 2 {
+		t.Fatalf("resume: %+v %v", result, err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if fmt.Sprint(modes) != "[false false false true]" || mutations != 2 || len(signed) != 4 || downloads != 4 {
+		t.Fatalf("modes=%v mutations=%d signed=%v downloads=%d", modes, mutations, signed, downloads)
+	}
+	for _, key := range signed {
+		if strings.Contains(key, "/old") {
+			t.Errorf("signed committed file %s", key)
+		}
+	}
+}

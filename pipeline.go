@@ -5,19 +5,22 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"sync"
+	"time"
 )
 
 type fileDownloader interface {
 	download(context.Context, string, *downloadLink, string) (string, int64, error)
 }
 type fileImporter interface {
-	importFile(context.Context, fileTask, string, int64) (int64, bool, error)
+	importBatch(context.Context, []downloadedFile) (totals, error)
 }
 type downloadedFile struct {
-	Task fileTask
-	Path string
-	Size int64
+	Task     fileTask
+	Path     string
+	Size     int64
+	QueuedAt time.Time
 }
 
 // Listing, downloads, and entity imports overlap across page boundaries. Bounded
@@ -32,11 +35,40 @@ type importPipeline struct {
 	err    error
 }
 
-func newImportPipeline(ctx context.Context, api fileDownloader, store fileImporter, dir string, downloads, imports int, logger *log.Logger) *importPipeline {
+type batchOptions struct {
+	Size, BufferFiles  int
+	Bytes, BufferBytes int64
+	Wait               time.Duration
+}
+
+func (o batchOptions) defaults() batchOptions {
+	if o.Size == 0 {
+		o.Size = 128
+	}
+	if o.BufferFiles == 0 {
+		o.BufferFiles = 1024
+	}
+	if o.Bytes == 0 {
+		o.Bytes = 64 << 20
+	}
+	if o.BufferBytes == 0 {
+		o.BufferBytes = 256 << 20
+	}
+	if o.Wait == 0 {
+		o.Wait = time.Second
+	}
+	return o
+}
+
+func newImportPipeline(ctx context.Context, api fileDownloader, store fileImporter, dir string, downloads, imports int, logger *log.Logger, options ...batchOptions) *importPipeline {
+	opts := batchOptions{}.defaults()
+	if len(options) > 0 {
+		opts = options[0].defaults()
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	p := &importPipeline{ctx: ctx, cancel: cancel, jobs: make(chan fileTask, downloads), done: make(chan struct{})}
 	ready := make(chan downloadedFile, downloads)
-	work := make(chan downloadedFile)
+	work := make(chan []downloadedFile)
 	completed := make(chan string, imports)
 	var downloading, importing sync.WaitGroup
 	for i := 0; i < downloads; i++ {
@@ -55,7 +87,7 @@ func newImportPipeline(ctx context.Context, api fileDownloader, store fileImport
 						return
 					}
 					select {
-					case ready <- downloadedFile{Task: task, Path: path, Size: size}:
+					case ready <- downloadedFile{Task: task, Path: path, Size: size, QueuedAt: time.Now()}:
 					case <-ctx.Done():
 						os.Remove(path)
 						return
@@ -66,25 +98,31 @@ func newImportPipeline(ctx context.Context, api fileDownloader, store fileImport
 	}
 	for i := 0; i < imports; i++ {
 		importing.Go(func() {
-			for f := range work {
-				rows, imported, err := store.importFile(ctx, f.Task, f.Path, f.Size)
-				os.Remove(f.Path)
+			for files := range work {
+				start := time.Now()
+				result, err := store.importBatch(ctx, files)
+				for _, f := range files {
+					os.Remove(f.Path)
+				}
 				if err != nil {
-					p.fail(fmt.Errorf("import %s: %w", f.Task.Key, err))
+					message := err.Error()
+					for _, f := range files {
+						message = strings.ReplaceAll(message, f.Path, f.Task.Key)
+					}
+					p.fail(fmt.Errorf("import %s batch: %s", files[0].Task.Entity, message))
 					return
 				}
 				p.mu.Lock()
-				if imported {
-					p.total.Imported++
-					p.total.Rows += rows
-					p.total.Bytes += f.Size
-					logger.Printf("imported %s (%d rows, %.1f MiB)", f.Task.Key, rows, float64(f.Size)/(1024*1024))
-				} else {
-					p.total.Skipped++
+				p.total.Imported += result.Imported
+				p.total.Skipped += result.Skipped
+				p.total.Rows += result.Rows
+				p.total.Bytes += result.Bytes
+				if result.Imported > 0 {
+					logger.Printf("imported %d %s files (%d rows, %.1f MiB) in %s; last key %s", result.Imported, files[0].Task.Entity, result.Rows, float64(result.Bytes)/(1024*1024), time.Since(start).Round(time.Millisecond), files[len(files)-1].Task.Key)
 				}
 				p.mu.Unlock()
 				select {
-				case completed <- f.Task.Entity:
+				case completed <- files[0].Task.Entity:
 				case <-ctx.Done():
 					return
 				}
@@ -95,57 +133,12 @@ func newImportPipeline(ctx context.Context, api fileDownloader, store fileImport
 	go func() {
 		defer close(scheduled)
 		defer close(work)
-		pending := []downloadedFile{}
-		defer func() {
-			for _, f := range pending {
-				os.Remove(f.Path)
-			}
-		}()
-		busy := map[string]bool{}
-		input := (<-chan downloadedFile)(ready)
-		for input != nil || len(pending) > 0 || len(busy) > 0 {
-			// Pick a ready entity instead of parking every importer behind one busy table.
-			index := -1
-			if len(busy) < imports {
-				for i, f := range pending {
-					if !busy[f.Task.Entity] {
-						index = i
-						break
-					}
-				}
-			}
-			var dispatch chan downloadedFile
-			var next downloadedFile
-			if index >= 0 {
-				dispatch = work
-				next = pending[index]
-			}
-			receive := input
-			if len(pending) >= 2*imports {
-				receive = nil
-			}
-			select {
-			case <-ctx.Done():
-				return
-			case f, ok := <-receive:
-				if !ok {
-					input = nil
-				} else {
-					pending = append(pending, f)
-				}
-			case dispatch <- next:
-				busy[next.Task.Entity] = true
-				pending = append(pending[:index], pending[index+1:]...)
-			case entity := <-completed:
-				delete(busy, entity)
-			}
-		}
+		scheduleBatches(ctx, ready, work, completed, imports, opts)
 	}()
 	go func() {
 		downloading.Wait()
 		close(ready)
 		<-scheduled
-		// On cancellation the scheduler may leave downloaded files in this channel.
 		for f := range ready {
 			os.Remove(f.Path)
 		}
@@ -153,6 +146,88 @@ func newImportPipeline(ctx context.Context, api fileDownloader, store fileImport
 		close(p.done)
 	}()
 	return p
+}
+
+func scheduleBatches(ctx context.Context, ready <-chan downloadedFile, work chan<- []downloadedFile, completed <-chan string, imports int, opts batchOptions) {
+	queues := map[string][]downloadedFile{}
+	var order []string
+	defer func() {
+		for _, queue := range queues {
+			for _, f := range queue {
+				os.Remove(f.Path)
+			}
+		}
+	}()
+	busy := map[string]bool{}
+	pending := 0
+	var pendingBytes int64
+	tick := time.NewTicker(min(opts.Wait, 100*time.Millisecond))
+	defer tick.Stop()
+	for ready != nil || pending > 0 || len(busy) > 0 {
+		pressure := pending >= opts.BufferFiles || pendingBytes >= opts.BufferBytes
+		var dispatch chan<- []downloadedFile
+		var batch []downloadedFile
+		selected := -1
+		if len(busy) < imports {
+			for i, entity := range order {
+				queue := queues[entity]
+				if busy[entity] || len(queue) == 0 {
+					continue
+				}
+				n := 0
+				var size int64
+				for n < len(queue) && n < opts.Size {
+					if n > 0 && size+queue[n].Size > opts.Bytes {
+						break
+					}
+					size += queue[n].Size
+					n++
+					if size >= opts.Bytes {
+						break
+					}
+				}
+				full := n == opts.Size || size >= opts.Bytes || n < len(queue)
+				if full || pressure || ready == nil || time.Since(queue[0].QueuedAt) >= opts.Wait {
+					dispatch = work
+					batch = queue[:n]
+					selected = i
+					break
+				}
+			}
+		}
+		receive := ready
+		if pressure {
+			receive = nil
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		case f, ok := <-receive:
+			if !ok {
+				ready = nil
+				continue
+			}
+			if _, ok := queues[f.Task.Entity]; !ok {
+				order = append(order, f.Task.Entity)
+			}
+			queues[f.Task.Entity] = append(queues[f.Task.Entity], f)
+			pending++
+			pendingBytes += f.Size
+		case dispatch <- batch:
+			entity := batch[0].Task.Entity
+			busy[entity] = true
+			// Copy the tail so later appends cannot overwrite a dispatched batch.
+			queues[entity] = append([]downloadedFile(nil), queues[entity][len(batch):]...)
+			pending -= len(batch)
+			for _, f := range batch {
+				pendingBytes -= f.Size
+			}
+			order = append(append(order[:selected], order[selected+1:]...), entity)
+		case entity := <-completed:
+			delete(busy, entity)
+		}
+	}
 }
 
 func (p *importPipeline) fail(err error) {
