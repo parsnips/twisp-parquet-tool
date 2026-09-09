@@ -42,7 +42,7 @@ func parseConfig(args []string) (config, error) {
 	fs.StringVar(&c.TempDir, "temp-dir", "", "Parent directory for temporary downloads (default OS temp directory)")
 	fs.StringVar(&c.MemoryLimit, "memory-limit", "1GB", "DuckDB memory limit; larger queries can spill to disk")
 	fs.IntVar(&c.PageSize, "page-size", 1000, "Files per listing page (1–1000)")
-	fs.IntVar(&c.Workers, "workers", 16, "Concurrent Parquet downloads")
+	fs.IntVar(&c.Workers, "workers", 16, "Concurrent Parquet downloads (1–128)")
 	fs.IntVar(&c.ImportWorkers, "import-workers", 4, "Concurrent DuckDB imports across entity types (one per entity)")
 	fs.IntVar(&c.Retries, "retries", 4, "Retries for transient API/download failures")
 	fs.DurationVar(&c.Timeout, "timeout", 10*time.Minute, "Timeout for each HTTP request, including a download")
@@ -79,8 +79,8 @@ func parseConfig(args []string) (config, error) {
 	if (c.Prefix != "warehouse" && c.Prefix != "warehouse/" && c.Prefix != "warehouse/parquet" && !strings.HasPrefix(c.Prefix, "warehouse/parquet/")) || strings.Contains(c.Prefix, "..") || strings.Contains(c.Prefix, "\\") {
 		return c, errors.New("-prefix must be warehouse or a warehouse/parquet/ prefix without parent paths")
 	}
-	if c.PageSize < 1 || c.PageSize > 1000 || c.Workers < 1 || c.Workers > 64 || c.ImportWorkers < 1 || c.ImportWorkers > 64 || c.Retries < 0 || c.Retries > 10 || c.Timeout <= 0 {
-		return c, errors.New("require page-size 1–1000, workers and import-workers 1–64, retries 0–10, and a positive timeout")
+	if c.PageSize < 1 || c.PageSize > 1000 || c.Workers < 1 || c.Workers > 128 || c.ImportWorkers < 1 || c.ImportWorkers > 64 || c.Retries < 0 || c.Retries > 10 || c.Timeout <= 0 {
+		return c, errors.New("require page-size 1–1000, workers 1–128, import-workers 1–64, retries 0–10, and a positive timeout")
 	}
 	if c.Batch.Size < 1 || c.Batch.Size > 4096 || c.Batch.Bytes < 1 || c.Batch.BufferFiles < 1 || c.Batch.BufferFiles > 65536 || c.Batch.BufferBytes < 1 || c.Batch.Wait <= 0 {
 		return c, errors.New("require batch-size 1–4096, buffer-files 1–65536, and positive batch-bytes, buffer-bytes, and batch-wait")
