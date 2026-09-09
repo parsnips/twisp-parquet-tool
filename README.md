@@ -286,3 +286,7 @@ automatic database migration with resume, overlapping entity imports, per-entity
 serialization, pipeline cancellation, and offline persistence.
 The optional DuckDB CLI test runs when `duckdb` is on PATH. No live Twisp token or
 tenant is needed to run the tests.
+
+## License
+
+[MIT](LICENSE) © 2026 Michael Parsons.
