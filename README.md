@@ -241,7 +241,7 @@ the entity views in `main` and `public`, and `_twisp`.
 -db             twisp.duckdb
 -prefix         warehouse
 -page-size      1000 (1–1000)
--workers        16 (1–128; concurrent downloads)
+-workers        16 (1–512; concurrent downloads)
 -import-workers 4 (1–64; concurrent entities, one import per entity)
 -batch-size     128 (1–4096; files per entity transaction)
 -batch-bytes    67108864 (64 MiB compressed; one oversized file allowed)
@@ -274,8 +274,8 @@ Paths containing `?` or `%` are rejected because of the Go driver's DSN handling
 ## Small-file performance
 
 For a warehouse with many tiny files, start with the defaults or increase downloads
-to `-workers 32`. For downloads limited by per-request latency, try 64 or 128
-workers and compare throughput after resume scanning finishes. Keep
+to `-workers 32`. For downloads limited by per-request latency, try 64, 128, or 256
+workers (up to 512 supported) and compare throughput after resume scanning finishes. Keep
 `-import-workers 4` while tuning downloads; the HTTP connection pool automatically
 scales with `-workers`. Batches can be tuned independently with `-batch-size 256` or
 `-batch-size 512`. Larger batches amortize transaction and query planning costs,
