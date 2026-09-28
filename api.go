@@ -17,6 +17,7 @@ import (
 
 type apiClient struct {
 	endpoint, token, tenant string
+	tokenFunc               func(context.Context) (string, error)
 	http                    *http.Client
 	retries                 int
 	backoff                 time.Duration
@@ -69,11 +70,18 @@ func (a *apiClient) graphql(ctx context.Context, query string, variables any, ou
 		return err
 	}
 	for attempt := 0; ; attempt++ {
+		token := a.token
+		if a.tokenFunc != nil {
+			token, err = a.tokenFunc(ctx)
+			if err != nil {
+				return err
+			}
+		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.endpoint, bytes.NewReader(body))
 		if err != nil {
 			return transportError(err)
 		}
-		req.Header.Set("Authorization", "Bearer "+a.token)
+		req.Header.Set("Authorization", "Bearer "+token)
 		req.Header.Set("x-twisp-account-id", a.tenant)
 		req.Header.Set("Content-Type", "application/json")
 		resp, err := a.http.Do(req)
@@ -118,7 +126,7 @@ func (a *apiClient) graphql(ctx context.Context, query string, variables any, ou
 		if len(envelope.Errors) != 0 {
 			messages := make([]string, len(envelope.Errors))
 			for i, e := range envelope.Errors {
-				messages[i] = strings.ReplaceAll(e.Message, a.token, "[REDACTED]")
+				messages[i] = strings.ReplaceAll(e.Message, token, "[REDACTED]")
 			}
 			return fmt.Errorf("GraphQL: %s", strings.Join(messages, "; "))
 		}

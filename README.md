@@ -6,7 +6,7 @@ It creates Redshift-style current and history views, including `account` and
 `account_history`. Once imported, all queries run offline.
 
 The importer embeds DuckDB through the [official Go driver](https://github.com/duckdb/duckdb-go).
-It requires no Twisp SDK, AWS credentials, Redshift, ClickHouse server, or separate
+Token-based imports require no Twisp SDK, AWS credentials, Redshift, ClickHouse server, or separate
 DuckDB installation to import data. A DuckDB client is only needed to explore the
 result afterward.
 
@@ -48,6 +48,45 @@ or environment:
 ```
 
 You can also set `TWISP_ENDPOINT`.
+
+### AWS IAM and AWS SSO
+
+Use `-auth aws-iam` to obtain a temporary Twisp JWT through the AWS SDK's
+credential chain. For an AWS SSO profile, first sign in with the AWS CLI:
+
+```bash
+aws sso login --profile my-sandbox
+./twisp-parquet-tool \
+  -auth aws-iam \
+  -aws-profile my-sandbox \
+  -aws-region us-east-2 \
+  -tenant YOUR_TWISP_ACCOUNT_ID \
+  -db ./sandbox.duckdb
+```
+
+`-aws-region` is required and selects both the Twisp cloud authentication and
+GraphQL endpoints. An explicit `-endpoint` or `TWISP_ENDPOINT` must match that
+region's cloud GraphQL endpoint. Custom endpoints remain supported with token
+authentication. Omit `-aws-profile` to use the SDK's default credential chain,
+including `AWS_PROFILE`, environment credentials, or an instance/task role.
+The tool does not open a browser or run `aws sso login` for you.
+
+The tool signs an STS `GetCallerIdentity` request and exchanges it with Twisp's
+IAM token endpoint. The JWT stays in memory and is refreshed before GraphQL
+requests when less than one minute of validity remains. Concurrent requests
+share the cached token. JWTs and signed identity proofs are never written to
+the database or logs, and download requests receive only their signed headers.
+The underlying AWS credentials must remain refreshable for a long import.
+
+Unset `TWISP_TOKEN` and omit `-token` when using `-auth aws-iam`; mixing the two
+authentication methods is rejected. Existing token-based commands continue to
+work as before.
+
+Successful token exchange authenticates the AWS identity but does not grant
+tenant permissions. The tenant must have a Twisp client/policy for that identity
+allowing file listing and downloads. If listing returns `unauthorized`, verify
+the account ID, region, and client policies with your Twisp administrator.
+See [Twisp security and authentication](https://www.twisp.com/docs/infrastructure/security-and-auth).
 
 ## How import works
 
@@ -235,7 +274,10 @@ the entity views in `main` and `public`, and `_twisp`.
 ## Options
 
 ```text
--token          TWISP_TOKEN; required
+-auth           token (default) or aws-iam
+-token          TWISP_TOKEN; required for token authentication
+-aws-profile    AWS shared profile; optional for aws-iam
+-aws-region     Twisp cloud region; required for aws-iam
 -tenant         TWISP_TENANT; required
 -endpoint       TWISP_ENDPOINT, or the US East 1 cloud GraphQL endpoint
 -db             twisp.duckdb
