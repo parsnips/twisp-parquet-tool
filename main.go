@@ -21,6 +21,7 @@ const defaultEndpoint = "https://api.us-east-1.cloud.twisp.com/financial/v1/grap
 
 type config struct {
 	Token, Tenant, Endpoint, Database, Prefix, TempDir, MemoryLimit string
+	Auth, AWSProfile, AWSRegion                                     string
 	PageSize, Workers, ImportWorkers, Retries                       int
 	Timeout                                                         time.Duration
 	Batch                                                           batchOptions
@@ -31,6 +32,9 @@ func parseConfig(args []string) (config, error) {
 	fs := flag.NewFlagSet("twisp-parquet-tool", flag.ContinueOnError)
 	// Read the environment after parsing so -help never prints a token as a default.
 	fs.StringVar(&c.Token, "token", "", "Bearer token (or TWISP_TOKEN)")
+	fs.StringVar(&c.Auth, "auth", "token", "Authentication method: token or aws-iam")
+	fs.StringVar(&c.AWSProfile, "aws-profile", "", "AWS shared profile for aws-iam (otherwise use the SDK credential chain)")
+	fs.StringVar(&c.AWSRegion, "aws-region", "", "Twisp cloud region; required for aws-iam")
 	fs.StringVar(&c.Tenant, "tenant", os.Getenv("TWISP_TENANT"), "Twisp account ID sent as x-twisp-account-id (or TWISP_TENANT)")
 	endpoint := os.Getenv("TWISP_ENDPOINT")
 	if endpoint == "" {
@@ -65,8 +69,34 @@ func parseConfig(args []string) (config, error) {
 		c.Token = strings.TrimSpace(c.Token[7:])
 	}
 	c.Tenant = strings.TrimSpace(c.Tenant)
-	if c.Token == "" || c.Tenant == "" {
+	if c.Auth != "token" && c.Auth != "aws-iam" {
+		return c, errors.New("-auth must be token or aws-iam")
+	}
+	if c.Tenant == "" || (c.Auth == "token" && c.Token == "") {
 		return c, errors.New("provide -token and -tenant, or TWISP_TOKEN and TWISP_TENANT")
+	}
+	if c.Auth == "aws-iam" {
+		if c.Token != "" {
+			return c, errors.New("-auth aws-iam cannot be combined with -token or TWISP_TOKEN")
+		}
+		if !regexp.MustCompile(`^[a-z]{2}(?:-[a-z]+)+-[0-9]+$`).MatchString(c.AWSRegion) {
+			return c, errors.New("-auth aws-iam requires a valid -aws-region, for example us-east-1")
+		}
+		cloudEndpoint := "https://api." + c.AWSRegion + ".cloud.twisp.com/financial/v1/graphql"
+		var explicitEndpoint bool
+		fs.Visit(func(f *flag.Flag) {
+			if f.Name == "endpoint" {
+				explicitEndpoint = true
+			}
+		})
+		if !explicitEndpoint && os.Getenv("TWISP_ENDPOINT") == "" {
+			c.Endpoint = cloudEndpoint
+		}
+		if c.Endpoint != cloudEndpoint {
+			return c, errors.New("aws-iam requires the Twisp cloud GraphQL endpoint matching -aws-region")
+		}
+	} else if c.AWSProfile != "" || c.AWSRegion != "" {
+		return c, errors.New("-aws-profile and -aws-region require -auth aws-iam")
 	}
 	u, err := url.Parse(c.Endpoint)
 	if err != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
@@ -106,6 +136,18 @@ type totals struct{ Imported, Skipped, Rows, Bytes int64 }
 
 func run(ctx context.Context, c config, logger *log.Logger) (totals, error) {
 	var total totals
+	api := newAPI(c)
+	defer api.http.CloseIdleConnections()
+	if c.Auth == "aws-iam" {
+		auth, err := newIAMAuth(ctx, c, api.http)
+		if err != nil {
+			return total, err
+		}
+		api.tokenFunc = auth.bearer
+		if _, err := auth.bearer(ctx); err != nil {
+			return total, err
+		}
+	}
 	dbPath, err := filepath.Abs(c.Database)
 	if err != nil {
 		return total, err
@@ -133,8 +175,6 @@ func run(ctx context.Context, c config, logger *log.Logger) (totals, error) {
 		return total, err
 	}
 	defer os.RemoveAll(dir)
-	api := newAPI(c)
-	defer api.http.CloseIdleConnections()
 	pipeline := newImportPipeline(ctx, api, s, dir, c.Workers, imports, logger, c.Batch)
 	logger.Printf("pipeline: %d downloads, up to %d concurrent entity imports, up to %d files per batch", c.Workers, imports, c.Batch.defaults().Size)
 	var skipped int64
